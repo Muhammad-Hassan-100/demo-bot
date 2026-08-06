@@ -38,6 +38,7 @@ const PIPELINE_ORDER = [
 let conversation = null;
 let activeStep = "how_are_you";
 let lastUserAt = 0;
+let endingForCallerRequest = false;
 
 function setStatus(text, className = "") {
   statusEl.textContent = text;
@@ -156,6 +157,44 @@ function hasPromptLeak(text) {
   return /\b(the user|the caller|my instructions|the next step|the script|conversation flow|based on the flow|i need to|i should)\b/i.test(text);
 }
 
+function callerControlRequest(text) {
+  const value = text.toLowerCase().replace(/[^a-z0-9?' ]/g, " ").replace(/\s+/g, " ").trim();
+  if (/\b(do not call|don't call|dont call|stop calling|remove my number|take me off|remove me from your list|unsubscribe|put me on the do not call list)\b/.test(value)) {
+    return { kind: "dnc", reason: "Caller requested Do Not Call" };
+  }
+  if (/\b(hang up|end the call|end this call|cut the call|please go|go away|leave me alone|i don't want to talk|i do not want to talk|goodbye|good bye|bye|fuck off|shut up)\b/.test(value)) {
+    return { kind: "hangup", reason: "Caller requested to end the call" };
+  }
+  return null;
+}
+
+function persistDnc(text) {
+  const lead = window.__DEMO_CONFIG?.lead || {};
+  void fetch("/api/dnc", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ reason: "caller_requested_dnc", transcript: text, lead }),
+    keepalive: true,
+  }).catch(() => {
+    addLog("sys", "DNC request detected; local persistence was unavailable.", "sys");
+  });
+}
+
+function endForCallerRequest(text, control) {
+  if (endingForCallerRequest) return;
+  endingForCallerRequest = true;
+  if (control.kind === "dnc") persistDnc(text);
+  addLog("sys", control.kind === "dnc" ? "DNC request detected — call ended." : "Caller requested to end — call ended.", "sys");
+  setStatus("Ended");
+  qaStatusEl.textContent = control.kind === "dnc" ? "DNC" : "Ended";
+  qaStatusEl.className = "mono";
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  const activeConversation = conversation;
+  conversation = null;
+  void activeConversation?.endSession().catch((error) => addLog("sys", describeError(error), "sys"));
+}
+
 function syncFromTranscript(source, text) {
   if (!text) return;
   if (source === "user") {
@@ -187,6 +226,7 @@ function syncFromTranscript(source, text) {
 function resetActivity() {
   activeStep = "how_are_you";
   lastUserAt = 0;
+  endingForCallerRequest = false;
   logEl.innerHTML = "";
   const empty = document.getElementById("transcriptEmpty");
   if (empty) empty.hidden = false;
@@ -225,8 +265,10 @@ async function startCall() {
           setStatus("Error", "danger");
         } else {
           setStatus("Ended");
-          qaStatusEl.textContent = "Ended";
-          qaStatusEl.className = "mono";
+          if (!endingForCallerRequest) {
+            qaStatusEl.textContent = "Ended";
+            qaStatusEl.className = "mono";
+          }
         }
         conversation = null;
         startBtn.disabled = false;
@@ -240,9 +282,13 @@ async function startCall() {
         setStatus(mode === "speaking" ? "Agent speaking" : "Listening", "live");
       },
       onMessage: ({ source, message }) => {
-        if (!message) return;
+        if (!message || (endingForCallerRequest && source !== "user")) return;
         syncFromTranscript(source, message);
         addLog(source === "user" ? "you" : "bot", message, source === "user" ? "you" : "bot");
+        if (source === "user") {
+          const control = callerControlRequest(message);
+          if (control) endForCallerRequest(message, control);
+        }
       },
       onError: (error) => {
         addLog("sys", describeError(error), "sys");

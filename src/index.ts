@@ -1,4 +1,5 @@
 import express from "express";
+import { appendFile, mkdir } from "fs/promises";
 import http from "http";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -10,7 +11,35 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "..", "public");
 
 const app = express();
+app.use(express.json({ limit: "32kb" }));
 app.use(express.static(publicDir));
+
+app.post("/api/dnc", async (req, res) => {
+  const body = req.body as {
+    reason?: unknown;
+    transcript?: unknown;
+    lead?: unknown;
+  };
+  const reason = typeof body.reason === "string" ? body.reason.slice(0, 240) : "caller_request";
+  const transcript = typeof body.transcript === "string" ? body.transcript.slice(0, 500) : "";
+  const lead = body.lead && typeof body.lead === "object" ? body.lead : {};
+  const record = JSON.stringify({
+    createdAt: new Date().toISOString(),
+    reason,
+    transcript,
+    lead,
+  });
+
+  try {
+    const dataDir = path.join(__dirname, "..", "data");
+    await mkdir(dataDir, { recursive: true });
+    await appendFile(path.join(dataDir, "dnc.jsonl"), record + "\n", "utf8");
+    res.status(201).json({ ok: true });
+  } catch (error) {
+    console.error("DNC persistence failed", error);
+    res.status(500).json({ ok: false });
+  }
+});
 
 app.get("/demo-config.js", (_req, res) => {
   const configScript = "window.__DEMO_CONFIG = " + JSON.stringify({
