@@ -1,26 +1,29 @@
 /**
- * Enterprise console UI + mic/PCM playback client.
+ * Direct ElevenLabs conversation with a passive UI observer.
+ * The observer reads final transcript events only; it never changes the agent prompt.
  */
+
+import { Conversation } from "https://cdn.jsdelivr.net/npm/@11labs/client@0.1.4/dist/lib.modern.js";
 
 const startBtn = document.getElementById("startBtn");
 const stopBtn = document.getElementById("stopBtn");
 const statusEl = document.getElementById("status");
-const stepCode = document.getElementById("stepCode");
+const leadNameEl = document.getElementById("leadName");
+const leadRepEl = document.getElementById("leadRep");
+const leadStateEl = document.getElementById("leadState");
+const stepCodeEl = document.getElementById("stepCode");
 const endpointEl = document.getElementById("endpoint");
 const partialEl = document.getElementById("partial");
-const userTurnEl = document.getElementById("userTurn");
 const decideMsEl = document.getElementById("decideMs");
-const leadName = document.getElementById("leadName");
-const leadRep = document.getElementById("leadRep");
-const leadState = document.getElementById("leadState");
-const lastIntent = document.getElementById("lastIntent");
-const stripIntent = document.getElementById("stripIntent");
-const turnReason = document.getElementById("turnReason");
-const qaStatus = document.getElementById("qaStatus");
-const qaFlags = document.getElementById("qaFlags");
-const qaNotes = document.getElementById("qaNotes");
+const userTurnEl = document.getElementById("userTurn");
+const turnReasonEl = document.getElementById("turnReason");
+const lastIntentEl = document.getElementById("lastIntent");
+const stripIntentEl = document.getElementById("stripIntent");
+const qaStatusEl = document.getElementById("qaStatus");
+const qaFlagsEl = document.getElementById("qaFlags");
+const qaNotesEl = document.getElementById("qaNotes");
 const logEl = document.getElementById("log");
-const pipeline = document.getElementById("pipeline");
+const pipelineEl = document.getElementById("pipeline");
 
 const PIPELINE_ORDER = [
   "how_are_you",
@@ -32,299 +35,240 @@ const PIPELINE_ORDER = [
   "transferring",
 ];
 
-let ws = null;
-let captureCtx = null;
-let playCtx = null;
-let mediaStream = null;
-let processor = null;
-let source = null;
-let muteGain = null;
-let playing = [];
-let nextPlayTime = 0;
-let pcmOddByte = null;
-const PLAY_RATE = 16000;
+let conversation = null;
+let activeStep = "how_are_you";
+let lastUserAt = 0;
 
-function setStatus(text, cls = "") {
+function setStatus(text, className = "") {
   statusEl.textContent = text;
-  statusEl.className = `chip ${cls}`.trim();
+  statusEl.className = ("chip " + className).trim();
 }
 
 function setPipeline(step) {
-  const idx = PIPELINE_ORDER.indexOf(step);
-  for (const li of pipeline.querySelectorAll("li")) {
-    const s = li.getAttribute("data-step");
-    li.classList.remove("active", "done", "fail");
-    const i = PIPELINE_ORDER.indexOf(s);
-    if (step === "disqualified" || step === "dnc" || step === "ended") {
-      if (i >= 0 && idx < 0) li.classList.add("fail");
-    }
-    if (s === step) li.classList.add("active");
-    else if (i >= 0 && idx >= 0 && i < idx) li.classList.add("done");
+  if (!PIPELINE_ORDER.includes(step)) return;
+  activeStep = step;
+  stepCodeEl.textContent = step;
+  const current = PIPELINE_ORDER.indexOf(step);
+  for (const item of pipelineEl.querySelectorAll("li")) {
+    const index = PIPELINE_ORDER.indexOf(item.dataset.step);
+    item.classList.toggle("active", item.dataset.step === step);
+    item.classList.toggle("done", index >= 0 && index < current);
   }
-  stepCode.textContent = step;
 }
 
-function addLog(who, text, cls = "") {
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[character]);
+}
+
+function addLog(who, text, className = who) {
   const empty = document.getElementById("transcriptEmpty");
   if (empty) empty.hidden = true;
-  const li = document.createElement("li");
-  li.className = cls || who;
-  li.innerHTML = `<span class="who">${who}</span><div>${escapeHtml(text)}</div>`;
-  logEl.prepend(li);
+  const item = document.createElement("li");
+  item.className = className;
+  item.innerHTML = '<span class="who">' + escapeHtml(who) + '</span><div>' + escapeHtml(text) + '</div>';
+  logEl.prepend(item);
 }
 
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-  }[c]));
-}
-
-function stopPlayback() {
-  for (const n of playing) {
-    try { n.stop(); } catch { /* */ }
+function describeError(value) {
+  if (value instanceof Error) return value.message;
+  if (value && typeof value === "object") {
+    const detail = value;
+    return [detail.message, detail.code && ("code " + detail.code), detail.reason]
+      .filter(Boolean)
+      .join(" — ") || JSON.stringify(detail);
   }
-  playing = [];
-  nextPlayTime = 0;
-  pcmOddByte = null;
+  return String(value);
 }
 
-function enqueuePcm16(arrayBuffer) {
-  if (!playCtx || !arrayBuffer.byteLength) return;
-  const probe = new Uint8Array(arrayBuffer, 0, Math.min(1, arrayBuffer.byteLength));
-  if (probe[0] === 0x7b) return;
+function applyAnalysis(analysis) {
+  if (analysis.step) setPipeline(analysis.step);
+  if (analysis.intent) lastIntentEl.textContent = analysis.intent;
+  if (analysis.reason) turnReasonEl.textContent = analysis.reason;
+  qaFlagsEl.textContent = analysis.flags?.length ? analysis.flags.join(" · ") : "—";
+  if (analysis.notes) qaNotesEl.textContent = analysis.notes;
+}
 
-  let merged;
-  if (pcmOddByte !== null) {
-    merged = new Uint8Array(1 + arrayBuffer.byteLength);
-    merged[0] = pcmOddByte;
-    merged.set(new Uint8Array(arrayBuffer), 1);
-    pcmOddByte = null;
-  } else {
-    merged = new Uint8Array(arrayBuffer);
+function hydrateLead() {
+  const lead = window.__DEMO_CONFIG?.lead;
+  if (!lead) return;
+  leadNameEl.textContent = [lead.firstName, lead.lastName].filter(Boolean).join(" ");
+  leadRepEl.textContent = lead.rep || "—";
+  leadStateEl.textContent = lead.state || "—";
+}
+
+function classifyUserTurn(text) {
+  const value = text.toLowerCase().replace(/[^a-z0-9?' ]/g, " ").replace(/\s+/g, " ").trim();
+
+  if (/\b(i am not|i'm not|wrong person|wrong number)\b/.test(value)) {
+    return { intent: "Wrong person", reason: "Caller is not the listed lead", flags: ["Wrong person"], notes: "Agent should end without restarting." };
+  }
+  if (/\b(not interested|stop calling|leave me alone|don't call|do not call|goodbye|bye|fuck off|shut up|go away)\b/.test(value)) {
+    return { intent: "DNC / hostile", reason: "Caller requested to end", flags: ["Hangup requested"], notes: "Agent should end immediately." };
+  }
+  if (/\b(callback|call me back|busy|driving|in a meeting|can't talk|cannot talk)\b/.test(value)) {
+    return { intent: "Busy / callback", reason: "Caller cannot continue", flags: ["End call"], notes: "Acknowledge the stated reason and end." };
+  }
+  if (/\b(can you hear me|do you hear me|hear me clearly|can't hear|cannot hear|not hearing)\b/.test(value)) {
+    return { intent: "Audio check", reason: "Caller checked audio", flags: [], notes: "Answer audio before resuming the flow." };
+  }
+  if (/\b(urdu|hindi|punjabi|spanish|language)\b/.test(value)) {
+    return { intent: "Language request", reason: "Caller requested another language", flags: [], notes: "State the supported language clearly." };
+  }
+  if (/\b(who is alex|who's alex|who are you|who is calling|who's calling|why are you calling|why calling|what do you want)\b/.test(value)) {
+    return { intent: "Identity / why call", reason: "Caller asked identity or purpose", flags: [], notes: "Answer identity and purpose first." };
+  }
+  if (/\b(medicare|medicaid|insurance|insured|coverage|work insurance|work coverage|employer coverage)\b/.test(value)) {
+    const step = activeStep === "state_confirm" || activeStep === "insurance_check_2" ? "insurance_check_2" : "insurance_check_1";
+    return { intent: "Coverage answer", reason: "Caller answered a coverage gate", flags: [], notes: "Coverage answer received.", step };
+  }
+  if (/\b(texas|state|where do you live|where are you located)\b/.test(value)) {
+    return { intent: "State answer", reason: "Caller answered the state question", flags: [], notes: "State response received.", step: "state_confirm" };
+  }
+  if (/\b(subsidy|aca|affordable care|obamacare|health insurance)\b/.test(value)) {
+    return { intent: "Subsidy answer", reason: "Caller discussed the ACA offer", flags: [], notes: "Keep the offer factual.", step: "pitch" };
+  }
+  if (/\b(yes|yeah|yep|no|nope|maybe|not sure|i don't know|don't know)\b/.test(value)) {
+    return { intent: "Script answer", reason: "Caller answered the latest question", flags: [], notes: "Continue from the current agent step." };
+  }
+  return { intent: "Caller question", reason: "Caller spoke", flags: [], notes: "Answer the latest question first." };
+}
+
+function inferBotStep(text) {
+  const value = text.toLowerCase();
+  if (/\b(how are you|how are you doing)\b/.test(value)) return "how_are_you";
+  if (/\b(have you received|have you gotten|health subsidy|affordable care act)\b/.test(value)) return "pitch";
+  if (/\b(medicare|medicaid|insurance through work|work insurance|work coverage)\b/.test(value)) {
+    return activeStep === "state_confirm" || activeStep === "insurance_check_2" ? "insurance_check_2" : "insurance_check_1";
+  }
+  if (/\b(still in texas|what state|which state|state are you)\b/.test(value)) return "state_confirm";
+  if (/\b(connect you|licensed agent|transfer you|permission to connect)\b/.test(value)) return "transfer_consent";
+  if (/\b(transfer is ready|transferring|connecting you now)\b/.test(value)) return "transferring";
+  return null;
+}
+
+function hasPromptLeak(text) {
+  return /\b(the user|the caller|my instructions|the next step|the script|conversation flow|based on the flow|i need to|i should)\b/i.test(text);
+}
+
+function syncFromTranscript(source, text) {
+  if (!text) return;
+  if (source === "user") {
+    lastUserAt = performance.now();
+    userTurnEl.textContent = text;
+    partialEl.textContent = "Final transcript";
+    applyAnalysis(classifyUserTurn(text));
+    return;
   }
 
-  if (merged.byteLength % 2 === 1) {
-    pcmOddByte = merged[merged.byteLength - 1];
-    merged = merged.subarray(0, merged.byteLength - 1);
+  if (lastUserAt) {
+    decideMsEl.textContent = Math.round(performance.now() - lastUserAt) + " ms";
+    lastUserAt = 0;
   }
-  if (merged.byteLength < 2) return;
-
-  const clean = merged.buffer.slice(merged.byteOffset, merged.byteOffset + merged.byteLength);
-  const int16 = new Int16Array(clean);
-  const f32 = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
-
-  const buf = playCtx.createBuffer(1, f32.length, PLAY_RATE);
-  buf.copyToChannel(f32, 0);
-  const node = playCtx.createBufferSource();
-  node.buffer = buf;
-  node.connect(playCtx.destination);
-
-  const now = playCtx.currentTime;
-  if (nextPlayTime < now + 0.012) nextPlayTime = now + 0.012;
-  node.start(nextPlayTime);
-  nextPlayTime += buf.duration;
-  playing.push(node);
-  node.onended = () => {
-    playing = playing.filter((n) => n !== node);
-    if (!playing.length && ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "playback_done" }));
-    }
-  };
-}
-
-function downsampleTo16k(float32, inRate) {
-  if (inRate === 16000) return float32ToInt16(float32);
-  const ratio = inRate / 16000;
-  const outLen = Math.floor(float32.length / ratio);
-  const out = new Float32Array(outLen);
-  for (let i = 0; i < outLen; i++) {
-    const start = Math.floor(i * ratio);
-    const end = Math.min(Math.floor((i + 1) * ratio), float32.length);
-    let sum = 0;
-    const n = Math.max(1, end - start);
-    for (let j = start; j < end; j++) sum += float32[j];
-    out[i] = sum / n;
+  const nextStep = inferBotStep(text);
+  if (nextStep) setPipeline(nextStep);
+  if (hasPromptLeak(text)) {
+    qaStatusEl.textContent = "FLAGGED";
+    qaStatusEl.className = "mono bad";
+    applyAnalysis({
+      intent: "Prompt leak",
+      reason: "Agent exposed internal instructions",
+      flags: ["Prompt leak"],
+      notes: "Review the remote agent prompt; UI is only observing this response.",
+    });
   }
-  return float32ToInt16(out);
 }
 
-function float32ToInt16(f32) {
-  const out = new Int16Array(f32.length);
-  for (let i = 0; i < f32.length; i++) {
-    const s = Math.max(-1, Math.min(1, f32[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out;
-}
-
-function int16ToArrayBuffer(pcm) {
-  return pcm.buffer.slice(pcm.byteOffset, pcm.byteOffset + pcm.byteLength);
-}
-
-async function startMic(sendPcm) {
-  captureCtx = new AudioContext();
-  playCtx = new AudioContext();
-  await Promise.all([captureCtx.resume(), playCtx.resume()]);
-
-  mediaStream = await navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: true,
-      noiseSuppression: true,
-      autoGainControl: true,
-      channelCount: 1,
-    },
-  });
-
-  source = captureCtx.createMediaStreamSource(mediaStream);
-  processor = captureCtx.createScriptProcessor(4096, 1, 1);
-  muteGain = captureCtx.createGain();
-  muteGain.gain.value = 0;
-
-  processor.onaudioprocess = (e) => {
-    const input = e.inputBuffer.getChannelData(0);
-    const copy = new Float32Array(input.length);
-    copy.set(input);
-    const pcm = downsampleTo16k(copy, captureCtx.sampleRate);
-    sendPcm(int16ToArrayBuffer(pcm));
-  };
-
-  source.connect(processor);
-  processor.connect(muteGain);
-  muteGain.connect(captureCtx.destination);
-}
-
-function cleanupAudio() {
-  stopPlayback();
-  try { processor?.disconnect(); } catch { /* */ }
-  try { source?.disconnect(); } catch { /* */ }
-  try { muteGain?.disconnect(); } catch { /* */ }
-  mediaStream?.getTracks().forEach((t) => t.stop());
-  void captureCtx?.close();
-  void playCtx?.close();
-  processor = source = muteGain = mediaStream = captureCtx = playCtx = null;
+function resetActivity() {
+  activeStep = "how_are_you";
+  lastUserAt = 0;
+  logEl.innerHTML = "";
+  const empty = document.getElementById("transcriptEmpty");
+  if (empty) empty.hidden = false;
+  hydrateLead();
+  setPipeline("how_are_you");
+  endpointEl.textContent = "ElevenLabs turn";
+  partialEl.textContent = "Final transcript";
+  decideMsEl.textContent = "—";
+  userTurnEl.textContent = "—";
+  turnReasonEl.textContent = "—";
+  lastIntentEl.textContent = "Waiting for caller";
+  stripIntentEl.textContent = "ElevenLabs session";
+  qaStatusEl.textContent = "Live";
+  qaStatusEl.className = "mono ok";
+  qaFlagsEl.textContent = "—";
+  qaNotesEl.textContent = "UI is observing the natural agent session";
 }
 
 async function startCall() {
   startBtn.disabled = true;
   stopBtn.disabled = false;
-  logEl.innerHTML = "";
-  const empty = document.getElementById("transcriptEmpty");
-  if (empty) empty.hidden = false;
-  setStatus("Connecting…", "warn");
-  setPipeline("how_are_you");
+  resetActivity();
+  setStatus("Connecting...", "warn");
 
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
-
-  ws.onopen = async () => {
-    try {
-      await startMic((buf) => {
-        if (ws?.readyState === WebSocket.OPEN) ws.send(buf);
-      });
-      ws.send(JSON.stringify({ type: "start" }));
-      setStatus("Live", "live");
-    } catch (e) {
-      setStatus("Mic error", "danger");
-      addLog("sys", String(e), "sys");
-      hangup();
-    }
-  };
-
-  ws.onmessage = (ev) => {
-    if (ev.data instanceof ArrayBuffer) {
-      enqueuePcm16(ev.data);
-      return;
-    }
-    handleMsg(JSON.parse(ev.data));
-  };
-
-  ws.onclose = () => {
-    setStatus("Idle");
+  try {
+    conversation = await Conversation.startSession({
+      agentId: window.__DEMO_CONFIG?.agentId,
+      onConnect: () => {
+        setStatus("Live", "live");
+        applyAnalysis({ intent: "Connected", reason: "Awaiting caller", flags: [], notes: "Natural conversation handled by ElevenLabs." });
+        addLog("sys", "Connected to the conversational agent.", "sys");
+      },
+      onDisconnect: (details) => {
+        if (details?.reason === "error") {
+          addLog("sys", describeError(details), "sys");
+          setStatus("Error", "danger");
+        } else {
+          setStatus("Ended");
+          qaStatusEl.textContent = "Ended";
+          qaStatusEl.className = "mono";
+        }
+        conversation = null;
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+      },
+      onStatusChange: ({ status }) => {
+        if (status === "connected") setStatus("Live", "live");
+        if (status === "connecting") setStatus("Connecting...", "warn");
+      },
+      onModeChange: ({ mode }) => {
+        setStatus(mode === "speaking" ? "Agent speaking" : "Listening", "live");
+      },
+      onMessage: ({ source, message }) => {
+        if (!message) return;
+        syncFromTranscript(source, message);
+        addLog(source === "user" ? "you" : "bot", message, source === "user" ? "you" : "bot");
+      },
+      onError: (error) => {
+        addLog("sys", describeError(error), "sys");
+        setStatus("Error", "danger");
+      },
+    });
+  } catch (error) {
+    addLog("sys", describeError(error), "sys");
+    setStatus("Mic error", "danger");
     startBtn.disabled = false;
     stopBtn.disabled = true;
-  };
-}
-
-function handleMsg(msg) {
-  switch (msg.type) {
-    case "ready":
-      leadName.textContent = `${msg.lead.firstName} ${msg.lead.lastName}`;
-      leadRep.textContent = msg.lead.rep;
-      leadState.textContent = msg.lead.state;
-      setPipeline(msg.step);
-      break;
-    case "partial":
-      if (msg.text) partialEl.textContent = msg.text;
-      break;
-    case "user_turn":
-      userTurnEl.textContent = msg.text;
-      turnReason.textContent = `${msg.reason} · ${msg.confidence.toFixed(2)}`;
-      addLog("you", msg.text);
-      partialEl.textContent = "—";
-      break;
-    case "decide_ms":
-      decideMsEl.textContent = `${msg.ms} ms`;
-      break;
-    case "qa": {
-      const bad = (msg.flags || []).filter((f) => f !== "ok");
-      lastIntent.textContent = `${msg.intent} (${Number(msg.confidence).toFixed(2)})`;
-      stripIntent.textContent = msg.intent;
-      qaFlags.textContent = (msg.flags || []).join(", ") || "—";
-      qaNotes.textContent = (msg.notes || []).join(" · ") || "—";
-      qaStatus.textContent = bad.length ? "FLAGGED" : "OK";
-      qaStatus.className = `mono ${bad.length ? "bad" : "ok"}`;
-      if (bad.length) {
-        addLog("sys", `QA: ${bad.join(", ")} — ${(msg.notes || []).join("; ")}`, "sys");
-      }
-      break;
-    }
-    case "bot_say":
-      stopPlayback();
-      setPipeline(msg.step);
-      endpointEl.textContent = `${msg.endpoint.endpointingMs}ms · ue ${msg.endpoint.utteranceEndMs}ms · conf≥${msg.endpoint.minConfidence}`;
-      addLog("bot", msg.text, "bot");
-      break;
-    case "barge_in":
-      stopPlayback();
-      setStatus("Barge-in", "warn");
-      addLog("sys", "Interrupted — TTS killed", "sys");
-      setTimeout(() => setStatus("Live", "live"), 500);
-      break;
-    case "transfer":
-      addLog("sys", msg.message, "sys");
-      setStatus("Transfer", "warn");
-      setPipeline("transferring");
-      break;
-    case "ended":
-      setStatus("Ended");
-      break;
-    case "error":
-      addLog("sys", msg.message, "sys");
-      setStatus("Error", "danger");
-      break;
-    case "warn":
-      addLog("sys", msg.message, "sys");
-      // Keep Live status — transient STT noise shouldn't hard-fail the call
-      break;
-    case "bot_done":
-      if (statusEl.textContent === "Error") setStatus("Live", "live");
-      break;
-    default:
-      break;
   }
 }
 
-function hangup() {
-  try { ws?.send(JSON.stringify({ type: "stop" })); } catch { /* */ }
-  try { ws?.close(); } catch { /* */ }
-  ws = null;
-  cleanupAudio();
+async function hangup() {
+  try {
+    await conversation?.endSession();
+  } catch (error) {
+    addLog("sys", describeError(error), "sys");
+  }
+  conversation = null;
   setStatus("Idle");
   startBtn.disabled = false;
   stopBtn.disabled = true;
 }
 
 startBtn.addEventListener("click", () => void startCall());
-stopBtn.addEventListener("click", hangup);
+stopBtn.addEventListener("click", () => void hangup());
+hydrateLead();

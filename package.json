@@ -12,6 +12,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@11labs/client": "^0.1.4",
     "@deepgram/sdk": "^3.11.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",

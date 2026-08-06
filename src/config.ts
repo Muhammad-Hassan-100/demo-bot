@@ -9,6 +9,7 @@ const envSchema = z.object({
   OPENROUTER_API_KEY: z.string().min(1),
   OPENROUTER_MODEL: z.string().default("openai/gpt-4o-mini"),
   ELEVENLABS_API_KEY: z.string().min(1),
+  ELEVENLABS_AGENT_ID: z.string().min(1),
   ELEVENLABS_VOICE_ID: z.string().default("21m00Tcm4TlvDq8ikWAM"),
   ELEVENLABS_MODEL_ID: z.string().default("eleven_flash_v2_5"),
   DEMO_FIRST_NAME: z.string().default("Jordan"),

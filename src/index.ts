@@ -12,6 +12,19 @@ const publicDir = path.join(__dirname, "..", "public");
 const app = express();
 app.use(express.static(publicDir));
 
+app.get("/demo-config.js", (_req, res) => {
+  const configScript = "window.__DEMO_CONFIG = " + JSON.stringify({
+    agentId: env.ELEVENLABS_AGENT_ID,
+    lead: {
+      firstName: env.DEMO_FIRST_NAME,
+      lastName: env.DEMO_LAST_NAME,
+      rep: env.DEMO_REP_NAME,
+      state: env.DEMO_STATE,
+    },
+  }) + ";";
+  res.type("application/javascript").send(configScript);
+});
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: "/ws" });
 
