@@ -3,7 +3,7 @@
  * Clarification intents are matched BEFORE greetings/mood to avoid wrong lead-ins.
  */
 
-import OpenAI from "openai";
+import { OpenAI } from "openai";
 import { z } from "zod";
 import { env } from "../config.js";
 import type { GateStep } from "../script/lines.js";
